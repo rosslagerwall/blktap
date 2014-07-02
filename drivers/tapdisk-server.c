@@ -45,6 +45,14 @@ typedef struct tapdisk_server {
 	char                        *name;
 	char                        *ident;
 	int                          facility;
+
+	/* Memory mode state */
+	int                          cfd;
+	int                          efd;
+	int                          event_control;
+	event_id_t                   mem_evid;
+	int                          mem_mode;
+	unsigned long                mem_used;
 } tapdisk_server_t;
 
 static tapdisk_server_t server;
@@ -360,6 +368,149 @@ tapdisk_server_signal_handler(int signal)
 	}
 }
 
+enum memory_mode_t
+tapdisk_server_mem_mode(void)
+{
+	return server.mem_mode;
+}
+
+static void tapdisk_server_reset_low_mem_mode(void);
+
+/* Return the number of bytes of memory used */
+static long get_mem_used(void)
+{
+	int fd;
+	ssize_t n;
+	long val = -1;
+	char buf[128];
+
+	fd = open("/sys/fs/cgroup/memory/memory.usage_in_bytes", O_RDONLY);
+	n = read(fd, buf, 127);
+	if (n > 0) {
+		buf[n] = '\0';
+		sscanf(buf, "%lu", &val);
+	}
+	close(fd);
+
+	return val;
+}
+
+/* Wait until the memory usage drops below 80% of what it was when we get the
+ * low memory event.
+ */
+#define MEMORY_LOW_WATER_THRESHOLD 80
+
+static void lowmem_timeout(event_id_t id, char mode, void *data)
+{
+	unsigned long mem_used;
+
+	mem_used = get_mem_used();
+        if (mem_used > 0 &&
+	    mem_used < (server.mem_used * MEMORY_LOW_WATER_THRESHOLD / 100)) {
+		DPRINTF("Leaving low memory mode\n");
+		server.mem_mode = NORMAL_MEMORY_MODE;
+		tapdisk_server_unregister_event(server.mem_evid);
+		tapdisk_server_reset_low_mem_mode();
+	}
+}
+
+/* We received a low memory event.  Switch into low memory mode. */
+static void lowmem_event(event_id_t id, char mode, void *data)
+{
+	uint64_t result;
+
+	read(server.efd, &result, sizeof result);
+	close(server.efd);
+	tapdisk_server_unregister_event(server.mem_evid);
+
+	server.mem_used = get_mem_used();
+	if (server.mem_used == -1) {
+		ERR(0, "Failed to enter low memory mode\n");
+		return;
+	}
+
+	server.mem_evid =
+		tapdisk_server_register_event(SCHEDULER_POLL_TIMEOUT,
+                                      -1,
+                                      10,
+                                      lowmem_timeout,
+                                      NULL);
+	if (server.mem_evid < 0) {
+		ERR(server.mem_evid,
+		    "Failed to initialize low memory handler: could not register event\n");
+		return;
+	}
+
+	server.mem_mode = LOW_MEMORY_MODE;
+	DPRINTF("Entering low memory mode\n");
+}
+
+#define LINE_MAX 128
+#define SYS_eventfd2 290  /* Required for compiling on old glibc */
+
+/* Called every time we need to listen for a low memory event */
+static void
+tapdisk_server_reset_low_mem_mode(void)
+{
+	int ret;
+	char line[LINE_MAX];
+
+	server.efd = syscall(SYS_eventfd2, 0, 0);
+	if (server.efd == -1) {
+		ERR(errno, "Failed to initialize low memory handler: %s\n",
+		    strerror(errno));
+		return;
+	}
+
+	ret = snprintf(line, LINE_MAX, "%d %d critical", server.efd,
+		       server.cfd);
+	if (ret >= LINE_MAX) {
+		ERR(errno,
+		    "Failed to initialize low memory handler: line too long\n");
+		return;
+	}
+
+	ret = write(server.event_control, line, strlen(line) + 1);
+	if (ret == -1) {
+		ERR(errno, "Failed to initialize low memory handler: %s\n",
+		    strerror(errno));
+		return;
+	}
+
+	server.mem_evid =
+		tapdisk_server_register_event(SCHEDULER_POLL_READ_FD,
+                                      server.efd,
+                                      0,
+                                      lowmem_event,
+                                      NULL);
+	if (server.mem_evid < 0) {
+		ERR(server.mem_evid,
+		    "Failed to initialize low memory handler: could not register event\n");
+		return;
+	}
+}
+
+/* Once-off initialization */
+static void
+tapdisk_server_initialize_low_mem_mode(void)
+{
+	server.cfd = open("/sys/fs/cgroup/memory/memory.pressure_level", O_RDONLY);
+	if (server.cfd == -1) {
+		ERR(errno, "Failed to initialize low memory handler: %s\n",
+		    strerror(errno));
+		return;
+	}
+
+	server.event_control = open("/sys/fs/cgroup/memory/cgroup.event_control", O_WRONLY);
+	if (server.event_control == -1) {
+		ERR(errno, "Failed to initialize low memory handler: %s\n",
+		    strerror(errno));
+		return;
+	}
+
+	tapdisk_server_reset_low_mem_mode();
+}
+
 int
 tapdisk_server_init(void)
 {
@@ -374,6 +525,8 @@ tapdisk_server_init(void)
 	INIT_LIST_HEAD(&server.vbds);
 
 	scheduler_initialize(&server.scheduler);
+
+	tapdisk_server_initialize_low_mem_mode();
 
 	return 0;
 }
