@@ -23,7 +23,6 @@
 #include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
-#include <limits.h>
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/signal.h>
@@ -57,7 +56,7 @@ typedef struct tapdisk_server {
 	struct {
 		int                          wfd; /* event to watch for */
 		int                          efd; /* event fd */
-		int                          event_control; /* control fd */
+		FILE                        *event_control; /* control fd */
 		event_id_t                   mem_evid; /* scheduler handle for
 		                                          low mem and backoff
 							  events */
@@ -383,6 +382,22 @@ tapdisk_server_signal_handler(int signal)
 	}
 }
 
+/* Low memory algorithm:
+ * Register for low memory notifications from the kernel.
+ * If a low memory notification is received, deregister for the notification
+ * and go into low memory mode for an exponential backoff amount of time.  When
+ * this time period has finished, return to normal memory mode and reregister
+ * for the low memory notification.  Also set a timer to reset the backoff
+ * value after a certain amount of time in normal mode.  If a low memory
+ * notification is received while the reset timer is running, cancel the reset
+ * timer.
+ *
+ * While perhaps a better alternative would be to remain subscribed to the
+ * notifications while in low memory mode and have an exponential backoff based
+ * on the notifications, these notifications can be frequent and bursty which
+ * is bad if there are a couple of thousand instances of tapdisk running.
+ */
+
 #ifndef HAVE_EVENTFD
 int eventfd(unsigned int initval, int flags)
 {
@@ -392,7 +407,12 @@ int eventfd(unsigned int initval, int flags)
 
 #define MIN_BACKOFF 8
 #define MAX_BACKOFF 512
-#define MAX_BACKOFF_STR "512"
+#define RESET_BACKOFF 512
+#define RESET_BACKOFF_STR "512"
+
+#define MEMORY_PRESSURE_LEVEL "critical"
+#define MEMORY_PRESSURE_PATH "/sys/fs/cgroup/memory/memory.pressure_level"
+#define EVENT_CONTROL_PATH "/sys/fs/cgroup/memory/cgroup.event_control"
 
 static int tapdisk_server_reset_lowmem_mode(void);
 
@@ -402,21 +422,31 @@ tapdisk_server_mem_mode(void)
 	return server.mem_state.mode;
 }
 
-static void lowmem_cleanup(void)
+static void lowmem_state_init(void)
 {
-	close(server.mem_state.wfd);
-	close(server.mem_state.efd);
-	close(server.mem_state.event_control);
-	tapdisk_server_unregister_event(server.mem_state.mem_evid);
-	tapdisk_server_unregister_event(server.mem_state.reset_evid);
-
 	server.mem_state.wfd = -1;
 	server.mem_state.efd = -1;
-	server.mem_state.event_control = -1;
+	server.mem_state.event_control = NULL;
 	server.mem_state.mem_evid = -1;
 	server.mem_state.reset_evid = -1;
 	server.mem_state.backoff = MIN_BACKOFF;
 	server.mem_state.mode = NORMAL_MEMORY_MODE;
+}
+
+static void lowmem_cleanup(void)
+{
+	if (server.mem_state.wfd >= 0)
+		close(server.mem_state.wfd);
+	if (server.mem_state.efd >= 0)
+		close(server.mem_state.efd);
+	if (server.mem_state.event_control)
+		fclose(server.mem_state.event_control);
+	if (server.mem_state.mem_evid >= 0)
+		tapdisk_server_unregister_event(server.mem_state.mem_evid);
+	if (server.mem_state.reset_evid >= 0)
+		tapdisk_server_unregister_event(server.mem_state.reset_evid);
+
+	lowmem_state_init();
 }
 
 /* Called when backoff period finishes */
@@ -445,14 +475,14 @@ static void lowmem_event(event_id_t id, char mode, void *data)
 	ssize_t n;
 	int backoff;
 
-	n = read(server.mem_state.efd, &result, sizeof result);
+	n = read(server.mem_state.efd, &result, sizeof(result));
 	if (n < 0) {
 		ERR(-errno, "Failed to read from eventfd: %s\n",
 		    strerror(-errno));
 		lowmem_cleanup();
 		return;
 	}
-	if (n != sizeof result) {
+	if (n != sizeof(result)) {
 		ERR(n,
 		    "Failed to read from eventfd: short read\n");
 		lowmem_cleanup();
@@ -494,34 +524,33 @@ static void lowmem_event(event_id_t id, char mode, void *data)
 		server.mem_state.backoff *= 2;
 }
 
-/* If a low memory event isn't received for MAX_BACKOFF seconds, reset the
+/* If a low memory event isn't received for RESET_BACKOFF seconds, reset the
  * backoff
  */
 static void reset_timeout(event_id_t id, char mode, void *data)
 {
 	server.mem_state.backoff = MIN_BACKOFF;
-	DPRINTF("No low memory event for " MAX_BACKOFF_STR " seconds: "
+	tapdisk_server_unregister_event(server.mem_state.reset_evid);
+	server.mem_state.reset_evid = -1;
+	DPRINTF("No low memory event for " RESET_BACKOFF_STR " seconds: "
 		"resetting backoff\n");
 }
 
-/* Called every time we need to listen for a low memory event */
+/* Register for low memory notifications.  Register a timer to reset the
+ * exponential backoff if necessary.
+ */
 static int
 tapdisk_server_reset_lowmem_mode(void)
 {
-	int ret;
-	char line[LINE_MAX];
-
 	server.mem_state.efd = eventfd(0, 0);
 	if (server.mem_state.efd == -1)
 		return -errno;
 
-	ret = snprintf(line, LINE_MAX, "%d %d critical", server.mem_state.efd,
-		       server.mem_state.wfd);
-	if (ret >= LINE_MAX)
-		return -EINVAL;
-
-	ret = write(server.mem_state.event_control, line, strlen(line) + 1);
-	if (ret == -1)
+	if (fprintf(server.mem_state.event_control,
+		    "%d %d " MEMORY_PRESSURE_LEVEL,
+		    server.mem_state.efd, server.mem_state.wfd) < 0)
+		return -errno;
+	if (fflush(server.mem_state.event_control) < 0)
 		return -errno;
 
 	server.mem_state.mem_evid =
@@ -538,7 +567,7 @@ tapdisk_server_reset_lowmem_mode(void)
 		server.mem_state.reset_evid =
 			tapdisk_server_register_event(SCHEDULER_POLL_TIMEOUT,
 					-1,
-					MAX_BACKOFF,
+					RESET_BACKOFF,
 					reset_timeout,
 					NULL);
 		if (server.mem_state.reset_evid < 0)
@@ -552,23 +581,18 @@ tapdisk_server_reset_lowmem_mode(void)
 static int
 tapdisk_server_initialize_lowmem_mode(void)
 {
-	server.mem_state.wfd = -1;
-	server.mem_state.efd = -1;
-	server.mem_state.event_control = -1;
-	server.mem_state.mem_evid = -1;
-	server.mem_state.reset_evid = -1;
-	server.mem_state.backoff = MIN_BACKOFF;
+	lowmem_state_init();
 
 	srand(time(NULL));
 
 	server.mem_state.wfd =
-		open("/sys/fs/cgroup/memory/memory.pressure_level", O_RDONLY);
+		open(MEMORY_PRESSURE_PATH, O_RDONLY);
 	if (server.mem_state.wfd == -1)
 		return -errno;
 
 	server.mem_state.event_control =
-		open("/sys/fs/cgroup/memory/cgroup.event_control", O_WRONLY);
-	if (server.mem_state.event_control == -1)
+		fopen(EVENT_CONTROL_PATH, "w");
+	if (!server.mem_state.event_control)
 		return -errno;
 
 	return tapdisk_server_reset_lowmem_mode();
