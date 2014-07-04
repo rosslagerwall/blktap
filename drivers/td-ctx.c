@@ -280,14 +280,10 @@ tapdisk_xenio_ctx_process_ring(struct td_xenblkif *blkif,
      * If in low memory mode, don't copy any if there's some in flight.
      * Otherwise, only copy one.
      */
-    if (tapdisk_server_mem_mode() == LOW_MEMORY_MODE) {
-	    if (blkif->ring_size != blkif->n_reqs_free)
-		    limit = 0;
-	    else
-		    limit = blkif->n_reqs_free > 1 ? 1 : blkif->n_reqs_free;
-    } else {
+    if (tapdisk_server_mem_mode() == LOW_MEMORY_MODE)
+	    limit = blkif->ring_size != blkif->n_reqs_free ? 0 : 1;
+    else
 	    limit = blkif->n_reqs_free;
-    }
     do {
         reqs = &blkif->reqs_free[blkif->ring_size - blkif->n_reqs_free];
 
